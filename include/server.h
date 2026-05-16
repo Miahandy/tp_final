@@ -17,8 +17,4 @@
 
 void handle_client(int connfd, int conn_num);
 
-void daemonize();
-
-void log_msg(const char *msg);
-
 #endif
