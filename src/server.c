@@ -4,55 +4,32 @@
 #include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
-#include <sys/socket.h>
 
-#define MAX_THREADS 16
+#define MAX_CLIENTS FD_SETSIZE
+#define TIMEOUT_SEC 5
 
-int connexions_actives = 0;
-pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/* ========= THREAD-SAFE ============*/
-void afficher_statut()
-{
-	pthread_mutex_lock(&mutex);
-	printf("Clients actifs: %d\n", connexions_actives);
-	pthread_mutex_unlock(&mutex);
-}
-
-/* ========= THREAD CLIENT ============*/
-void* handle_client_thread(void *arg)
-{
-        int connfd = *(int*)arg;
-        free(arg);
-	printf("THREAD ACTIF TID=%d\n", getpid());
-        pthread_mutex_lock(&mutex);
-        connexions_actives++;
-        pthread_mutex_unlock(&mutex);
-	afficher_statut();
-
-	/* ======= Traitement  Client =======*/
-	sleep(10);
-        handle_client(connfd, connexions_actives);
-        close(connfd);
-        pthread_mutex_lock(&mutex);
-        connexions_actives--;
-        pthread_mutex_unlock(&mutex);
-	afficher_statut();
-
-	return NULL;
-}
-
-/* ========== MAIN ============*/
 int main(void)
 {
-    int listenfd, connfd;
-    struct sockaddr_in srv;
-    int opt = 1;
-    pthread_t tid;
+    int listenfd, connfd, maxfd, activity, i;
+    int clients[MAX_CLIENTS];
+    struct sockaddr_in srv, cli;
+    socklen_t len = sizeof(cli);
+
+    fd_set readfds;
+    struct timeval timeout;
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+	clients[i] = -1;
 
     /* ====== Création socket ======= */
     listenfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listenfd < 0)
+    {
+	perror("socket");
+        return 1;
+}
 
+    int opt = 1;
     setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     /* Configuration serveur */
@@ -72,51 +49,84 @@ int main(void)
         return 1;
     }
 
-    printf("Serveur multi-thread démarré sur port %d\n", PORT);
+    printf("Serveur SELECT démarré sur port %d\n", PORT);
 
     /* ======== BOUCLE ======== */
     while (1)
     {
-        connfd = accept(listenfd, NULL, NULL);
+	FD_ZERO(&readfds);
+	FD_SET(listenfd, &readfds);
+	maxfd = listenfd;
 
-        if (connfd < 0) {
-            perror("accept");
+        for (i = 0; i < MAX_CLIENTS; i++)
+	{
+	    if (clients[i] != -1)
+	    {
+		FD_SET(clients[i], &readfds);
+		if (clients[i] > maxfd)
+		    maxfd = clients[i];
+	    }
+	}
+
+	timeout.tv_sec = TIMEOUT_SEC;
+	timeout.tv_usec = 0;
+
+	activity = select(maxfd + 1, &readfds, NULL, NULL, &timeout);
+
+        if (activity < 0) {
+            perror("select");
             continue;
         }
 
-	pthread_mutex_lock(&mutex);
-
-        if (connexions_actives >= MAX_THREADS) 
+        if (FD_ISSET(listenfd, &readfds))
 	{
-            pthread_mutex_unlock(&mutex);
-	    char *msg = "Serveur saturé\n";
-	    write(connfd, msg, strlen(msg));
-	    close(connfd);
-	    continue;
+            connfd = accept(listenfd, (struct sockaddr*)&cli, &len);
+	    if (connfd < 0)
+	    {
+		perror("accept");
+            	continue;
+	    }
+
+	    for (i = 0; i < MAX_CLIENTS; i++)
+	    {
+		if (clients[i] == -1)
+		{
+		    clients[i] = connfd;
+		    break;
+		}
+	    }
 	}
 
-	pthread_mutex_unlock(&mutex);
+	for (i = 0; i < MAX_CLIENTS; i++)
+        {
+            if (clients[i] != -1 && FD_ISSET(clients[i], &readfds))
+            {
+                char buffer[1024];
+		int n = read(clients[i], buffer, sizeof(buffer) - 1);
 
-	int *fd = malloc(sizeof(int));
-	if (fd == NULL)
-	{
-	    perror("malloc");
-	    close(connfd);
-            continue;
-	}
-	*fd = connfd;
+                if (n <= 0)
+                {
+		    close(clients[i]);
+		    clients[i] = -1;
+		}
+                else
+                {
+                    buffer[n] = '\0';
+		    printf("Client: %s\n", buffer);
+                    write(clients[i], "OK\n", 3);
+                }
 
-	if (pthread_create(&tid, NULL, handle_client_thread, fd) != 0)
-	{
-	    perror("pthread_create");
-	    free(fd);
-            close(connfd);
-            continue;
-	}
+            }
 
-	pthread_detach(tid);
+        }
+
+	int count = 0;
+	for (i = 0; i < MAX_CLIENTS; i++)
+	    if (clients[i] != -1)
+		count++;
+
+	printf("Connexions actives: %d\n", count);
     }
 
-    close(listenfd);
     return 0;
 }
