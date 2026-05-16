@@ -17,4 +17,6 @@
 
 void handle_client(int connfd, int conn_num);
 
+void* handle_client_thread(void *arg);
+
 #endif

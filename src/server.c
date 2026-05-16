@@ -1,41 +1,58 @@
 #include "../include/server.h"
-#include "../include/utils.h"
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
 
-#include <signal.h>
-#include <sys/wait.h>
+#define MAX_THREADS 16
 
-/* ========== SIGCHLD ==========*/
-/* Objectif: éviter les processus zombies */
+int connexions_actives = 0;
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
-void sigchld_handler(int sig) 
+/* ========= THREAD-SAFE ============*/
+void afficher_statut()
 {
-	(void)sig;
-	while (waitpid(-1, NULL, WNOHANG) > 0);
+	pthread_mutex_lock(&mutex);
+	printf("Clients actifs: %d\n", connexions_actives);
+	pthread_mutex_unlock(&mutex);
 }
 
-/* =========== MAIN ============*/
+/* ========= THREAD CLIENT ============*/
+void* handle_client_thread(void *arg)
+{
+        int connfd = *(int*)arg;
+        free(arg);
+	printf("THREAD ACTIF TID=%d\n", getpid());
+        pthread_mutex_lock(&mutex);
+        connexions_actives++;
+        pthread_mutex_unlock(&mutex);
+	afficher_statut();
 
+	/* ======= Traitement  Client =======*/
+	sleep(10);
+        handle_client(connfd, connexions_actives);
+        close(connfd);
+        pthread_mutex_lock(&mutex);
+        connexions_actives--;
+        pthread_mutex_unlock(&mutex);
+	afficher_statut();
+
+	return NULL;
+}
+
+/* ========== MAIN ============*/
 int main(void)
 {
     int listenfd, connfd;
     struct sockaddr_in srv;
     int opt = 1;
-    pid_t pid;
-    int conn_num;
+    pthread_t tid;
 
-    /* Gestion zombies */
-    signal(SIGCHLD, sigchld_handler);
-
-    /* Création socket */
+    /* ====== Création socket ======= */
     listenfd = socket(AF_INET, SOCK_STREAM, 0);
 
-    if (listenfd < 0)
-    {
-        perror("socket");
-        return 1;
-    }
-
-    /* SO_REUSEADDR */
     setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     /* Configuration serveur */
@@ -45,16 +62,17 @@ int main(void)
 
     if (bind(listenfd, (struct sockaddr*)&srv, sizeof(srv)) < 0)
     {
-        perror("bind");
-        return 1;
+	perror("bind");
+	return 1;
     }
 
-    if (listen(listenfd, BACKLOG) < 0) {
+    if (listen(listenfd, BACKLOG) < 0)
+    {
         perror("listen");
         return 1;
     }
 
-    printf("Serveur concurrent démarré sur port %d\n", PORT);
+    printf("Serveur multi-thread démarré sur port %d\n", PORT);
 
     /* ======== BOUCLE ======== */
     while (1)
@@ -66,34 +84,39 @@ int main(void)
             continue;
         }
 
-	/* IPC computeur propre */
-        conn_num = get_conn_count() + 1;
-	update_conn_count(conn_num);
+	pthread_mutex_lock(&mutex);
 
-	pid = fork();
-
-        if (pid == 0) 
+        if (connexions_actives >= MAX_THREADS) 
 	{
-	/* ====== FILS ========*/
-            close(listenfd);
-
-	    printf("Client #%d traité (PID%d)\n", conn_num, getpid());
-
-            handle_client(connfd, conn_num);
-
+            pthread_mutex_unlock(&mutex);
+	    char *msg = "Serveur saturé\n";
+	    write(connfd, msg, strlen(msg));
 	    close(connfd);
-	    return 0;
+	    continue;
 	}
-	else if (pid > 0)
+
+	pthread_mutex_unlock(&mutex);
+
+	int *fd = malloc(sizeof(int));
+	if (fd == NULL)
 	{
+	    perror("malloc");
 	    close(connfd);
+            continue;
 	}
-	else
+	*fd = connfd;
+
+	if (pthread_create(&tid, NULL, handle_client_thread, fd) != 0)
 	{
-	/* ====== PERE ========*/
-	    perror("fork");
+	    perror("pthread_create");
+	    free(fd);
+            close(connfd);
+            continue;
 	}
+
+	pthread_detach(tid);
     }
 
+    close(listenfd);
     return 0;
 }
