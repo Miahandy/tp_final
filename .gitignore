@@ -1,0 +1,5 @@
+*.o
+server
+a.out
+*.log
+*.pid
